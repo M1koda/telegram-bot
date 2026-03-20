@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import requests
+
 from config import TOKEN
+from settings import (
+    MENU_CLOSE_CHAT_BUTTON_TEXT,
+    MENU_CONNECTION_BUTTON_TEXT,
+    MENU_SUPPORT_BUTTON_TEXT,
+    PHONE_REQUEST_BUTTON_TEXT,
+)
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
@@ -39,10 +46,30 @@ def send_message(chat_id: int, text: str, reply_markup=None, disable_web_page_pr
     return tg("sendMessage", payload)
 
 
-def answer_callback(callback_id: str, text: str = ""):
+def edit_message(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup=None,
+    disable_web_page_preview=True,
+):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": disable_web_page_preview,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    return tg("editMessageText", payload)
+
+
+def answer_callback(callback_id: str, text: str = "", show_alert: bool = False):
     payload = {"callback_query_id": callback_id}
     if text:
         payload["text"] = text
+    if show_alert:
+        payload["show_alert"] = True
     return tg("answerCallbackQuery", payload)
 
 
@@ -61,8 +88,31 @@ def btn(text: str):
     return {"text": text}
 
 
-def kb_main():
-    return kb_reply([
-        [btn("🛠 Звернутись у тех. підтримку")],
-        [btn("📡 Заявка на підключення")],
-    ])
+def contact_btn(text: str):
+    return {"text": text, "request_contact": True}
+
+
+def ibtn(text: str, callback_data: str):
+    return {"text": text, "callback_data": callback_data}
+
+
+def kb_main(*, show_close_chat: bool = False):
+    rows = [
+        [btn(MENU_SUPPORT_BUTTON_TEXT)],
+        [btn(MENU_CONNECTION_BUTTON_TEXT)],
+    ]
+    if show_close_chat:
+        rows.append([btn(MENU_CLOSE_CHAT_BUTTON_TEXT)])
+    return kb_reply(rows)
+
+
+def kb_inline(rows: list[list[dict]]):
+    return {"inline_keyboard": rows}
+
+
+def kb_single_button(text: str):
+    return kb_reply([[btn(text)]])
+
+
+def kb_request_contact(text: str = PHONE_REQUEST_BUTTON_TEXT):
+    return kb_reply([[contact_btn(text)]])
