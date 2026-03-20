@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+config.py
+.env
+
+bot_state.json
+support.db
+*.db-shm
+*.db-wal
+
+old_backup/
