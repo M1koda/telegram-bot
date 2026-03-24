@@ -11,6 +11,7 @@ from settings import (
 )
 
 API = f"https://api.telegram.org/bot{TOKEN}"
+FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 
 
 class TelegramAPIError(RuntimeError):
@@ -78,6 +79,21 @@ def get_updates(offset: int | None, timeout_s: int = 30):
     if offset is not None:
         params["offset"] = offset
     return tg("getUpdates", params, method_type="get", timeout=timeout_s + 5)
+
+
+def get_user_profile_photos(user_id: int, limit: int = 1):
+    return tg("getUserProfilePhotos", {"user_id": user_id, "limit": limit})
+
+
+def get_file(file_id: str):
+    return tg("getFile", {"file_id": file_id})
+
+
+def download_file(file_path: str, *, timeout: int = 30) -> tuple[bytes, str | None]:
+    url = f"{FILE_API}/{str(file_path).lstrip('/')}"
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp.content, resp.headers.get("Content-Type")
 
 
 def kb_reply(rows: list[list[dict]], resize=True):

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
 import socketio
 
-from config import CONNECTION_CALL_TARGET_CHAT_ID, SUPPORT_API_BASE_URL, SUPPORT_BOT_API_KEY, ZIP_SOCKET_URL
+from config import (
+    CONNECTION_CALL_TARGET_CHAT_ID,
+    SUPPORT_API_BASE_URL,
+    SUPPORT_BOT_API_KEY,
+    ZIP_SOCKET_URL,
+)
 from settings import (
     CHAT_CLOSE_ERROR_TEXT,
     CHAT_CLOSE_UNAVAILABLE_TEXT,
@@ -63,8 +71,11 @@ from state import StateStore
 from telegram_api import (
     TelegramAPIError,
     answer_callback,
+    download_file,
     edit_message,
+    get_file,
     get_updates,
+    get_user_profile_photos,
     ibtn,
     btn,
     kb_inline,
@@ -83,11 +94,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("zip-support-bot")
 
+DEFAULT_SUPPORT_AVATAR_CACHE_DIR = Path(__file__).resolve().parent / "support_avatars"
+
 
 class SupportBot:
     def __init__(self):
         self.state = StateStore(STATE_FILE)
         self.zip = ZipSupportClient(SUPPORT_API_BASE_URL, SUPPORT_BOT_API_KEY)
+        self.avatar_cache_dir = Path(
+            os.getenv("SUPPORT_AVATAR_CACHE_DIR", str(DEFAULT_SUPPORT_AVATAR_CACHE_DIR))
+        )
+        self.avatar_public_base_url = os.getenv("SUPPORT_AVATAR_PUBLIC_BASE_URL", "").rstrip("/")
+        self.avatar_refresh_seconds = max(0, int(os.getenv("SUPPORT_AVATAR_REFRESH_SECONDS", "86400")))
         self.sio = socketio.Client(
             reconnection=True,
             reconnection_attempts=ZIP_SOCKET_RECONNECT_ATTEMPTS or 0,
@@ -96,6 +114,16 @@ class SupportBot:
             ssl_verify=ZIP_SOCKET_VERIFY_SSL,
         )
         self.offset: int | None = None
+        if self.avatar_public_base_url:
+            self.avatar_cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "Avatar cache enabled dir=%s base_url=%s refresh_seconds=%s",
+                self.avatar_cache_dir,
+                self.avatar_public_base_url,
+                self.avatar_refresh_seconds,
+            )
+        else:
+            logger.warning("Avatar cache disabled: SUPPORT_AVATAR_PUBLIC_BASE_URL is not configured")
         self._register_socket_handlers()
 
     def _has_open_chat(self, tg_user_id: int) -> bool:
@@ -596,10 +624,12 @@ class SupportBot:
 
     def _forward_subscriber_message(self, tg_user_id: int, subscriber_name: str, text: str) -> int:
         subscriber_phone = self.state.get_subscriber_phone(tg_user_id)
+        subscriber_avatar_url = self._ensure_subscriber_avatar_url(tg_user_id)
         chat_data = self.zip.ensure_chat(
             tg_user_id,
             subscriber_name,
             subscriber_phone=subscriber_phone,
+            subscriber_avatar_url=subscriber_avatar_url,
         )
         _, current = self._sync_chat_snapshot(chat_data, source="ensure-chat")
         support_chat_id = self._extract_chat_id(chat_data, chat=current or chat_data)
@@ -622,6 +652,7 @@ class SupportBot:
                 tg_user_id,
                 subscriber_name,
                 subscriber_phone=subscriber_phone,
+                subscriber_avatar_url=subscriber_avatar_url,
             )
             _, refreshed_current = self._sync_chat_snapshot(refreshed_chat, source="ensure-chat-retry")
             refreshed_chat_id = self._extract_chat_id(refreshed_chat, chat=refreshed_current or refreshed_chat)
@@ -962,6 +993,152 @@ class SupportBot:
                 current.get("topic"),
             )
         return previous, current
+
+    def _ensure_subscriber_avatar_url(self, tg_user_id: int) -> str | None:
+        avatar_meta = self.state.get_subscriber_avatar(tg_user_id)
+        cached_url = self._get_cached_avatar_url(avatar_meta)
+        refresh_due = self._is_avatar_refresh_due(avatar_meta)
+
+        if cached_url and not refresh_due:
+            return cached_url
+        if avatar_meta and avatar_meta.get("hasAvatar") is False and not refresh_due:
+            return None
+        if not self.avatar_public_base_url:
+            return cached_url
+
+        try:
+            payload = get_user_profile_photos(tg_user_id, limit=1)
+            result = payload.get("result") or {}
+            photos = result.get("photos") or []
+            if not photos:
+                self._delete_cached_avatar_file(avatar_meta)
+                self.state.set_subscriber_avatar(tg_user_id, has_avatar=False)
+                return None
+
+            photo = self._select_profile_photo(photos[0])
+            file_id = str((photo or {}).get("file_id") or "").strip()
+            if not file_id:
+                self._delete_cached_avatar_file(avatar_meta)
+                self.state.set_subscriber_avatar(tg_user_id, has_avatar=False)
+                return None
+
+            file_payload = get_file(file_id)
+            file_info = file_payload.get("result") or {}
+            telegram_file_path = str(file_info.get("file_path") or "").strip()
+            if not telegram_file_path:
+                raise TelegramAPIError("Telegram getFile returned empty file_path")
+
+            content, content_type = download_file(telegram_file_path)
+            file_name = self._store_subscriber_avatar(
+                tg_user_id,
+                telegram_file_path,
+                content,
+                content_type=content_type,
+                avatar_meta=avatar_meta,
+            )
+            avatar_url = self._build_avatar_public_url(file_name)
+            self.state.set_subscriber_avatar(
+                tg_user_id,
+                url=avatar_url,
+                file_name=file_name,
+                has_avatar=True,
+            )
+            return avatar_url
+        except (OSError, requests.RequestException, TelegramAPIError):
+            logger.exception("Failed to sync subscriber avatar for Telegram user %s", tg_user_id)
+            return cached_url
+
+    def _get_cached_avatar_url(self, avatar_meta: dict[str, Any] | None) -> str | None:
+        if not isinstance(avatar_meta, dict):
+            return None
+
+        avatar_url = str(avatar_meta.get("url") or "").strip()
+        file_name = str(avatar_meta.get("fileName") or "").strip()
+        if not avatar_url or not file_name:
+            return None
+
+        if self._avatar_path(file_name).exists():
+            return avatar_url
+
+        logger.warning("Cached avatar file is missing for %s", file_name)
+        return None
+
+    def _is_avatar_refresh_due(self, avatar_meta: dict[str, Any] | None) -> bool:
+        if not isinstance(avatar_meta, dict):
+            return True
+
+        checked_at = self._safe_int(avatar_meta.get("checkedAt"))
+        if checked_at is None:
+            return True
+        if self.avatar_refresh_seconds <= 0:
+            return False
+        return (int(time.time()) - checked_at) >= self.avatar_refresh_seconds
+
+    def _store_subscriber_avatar(
+        self,
+        tg_user_id: int,
+        telegram_file_path: str,
+        content: bytes,
+        *,
+        content_type: str | None = None,
+        avatar_meta: dict[str, Any] | None = None,
+    ) -> str:
+        extension = self._infer_avatar_extension(telegram_file_path, content_type=content_type)
+        file_name = f"{tg_user_id}{extension}"
+        destination = self._avatar_path(file_name)
+        temp_destination = destination.with_name(f"{destination.name}.tmp")
+
+        self.avatar_cache_dir.mkdir(parents=True, exist_ok=True)
+        temp_destination.write_bytes(content)
+        temp_destination.replace(destination)
+
+        previous_file_name = str((avatar_meta or {}).get("fileName") or "").strip()
+        if previous_file_name and previous_file_name != file_name:
+            self._avatar_path(previous_file_name).unlink(missing_ok=True)
+
+        return file_name
+
+    def _build_avatar_public_url(self, file_name: str) -> str:
+        return f"{self.avatar_public_base_url}/{quote(file_name)}"
+
+    def _avatar_path(self, file_name: str) -> Path:
+        return self.avatar_cache_dir / file_name
+
+    def _delete_cached_avatar_file(self, avatar_meta: dict[str, Any] | None):
+        file_name = str((avatar_meta or {}).get("fileName") or "").strip()
+        if file_name:
+            self._avatar_path(file_name).unlink(missing_ok=True)
+
+    @staticmethod
+    def _infer_avatar_extension(telegram_file_path: str, *, content_type: str | None = None) -> str:
+        extension = Path(telegram_file_path).suffix.lower()
+        if extension in {".jpg", ".jpeg", ".png", ".webp"}:
+            return extension
+
+        content_type_map = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+        }
+        normalized_content_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        return content_type_map.get(normalized_content_type, ".jpg")
+
+    @staticmethod
+    def _select_profile_photo(photo_sizes: Any) -> dict[str, Any] | None:
+        if not isinstance(photo_sizes, list):
+            return None
+
+        candidates = [item for item in photo_sizes if isinstance(item, dict) and item.get("file_id")]
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda item: (
+                int(item.get("file_size") or 0),
+                int(item.get("width") or 0) * int(item.get("height") or 0),
+            ),
+        )
 
     def _should_request_phone(self, tg_user_id: int) -> bool:
         if self._has_open_chat(tg_user_id):

@@ -78,12 +78,15 @@ class ZipSupportClient:
         subscriber_telegram_id: int,
         subscriber_name: str | None = None,
         subscriber_phone: str | None = None,
+        subscriber_avatar_url: str | None = None,
     ) -> dict[str, Any]:
         payload = {"subscriberTelegramId": subscriber_telegram_id}
         if subscriber_name:
             payload["subscriberName"] = subscriber_name[:255]
         if subscriber_phone:
             payload["subscriberPhone"] = subscriber_phone
+        if subscriber_avatar_url:
+            payload["subscriberAvatarUrl"] = subscriber_avatar_url
         return self._extract_data(self._request("POST", "/chats", json=payload))
 
     def send_subscriber_message(self, chat_id: int, text: str) -> dict[str, Any]:

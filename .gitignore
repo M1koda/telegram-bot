@@ -8,6 +8,7 @@ config.py
 .env
 
 bot_state.json
+support_avatars/
 support.db
 *.db-shm
 *.db-wal

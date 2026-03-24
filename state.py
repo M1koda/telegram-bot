@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ class StateStore:
             "tg_to_chat": {},
             "chat_to_tg": {},
             "subscriber_phones": {},
+            "subscriber_avatars": {},
             "pending_phone_gate_users": [],
             "seen_operator_message_ids": [],
             "welcomed_chat_ids": [],
@@ -33,6 +35,7 @@ class StateStore:
         self.data.setdefault("tg_to_chat", {})
         self.data.setdefault("chat_to_tg", {})
         self.data.setdefault("subscriber_phones", {})
+        self.data.setdefault("subscriber_avatars", {})
         self.data.setdefault("pending_phone_gate_users", [])
         self.data.setdefault("seen_operator_message_ids", [])
         self.data.setdefault("welcomed_chat_ids", [])
@@ -100,6 +103,42 @@ class StateStore:
 
     def has_subscriber_phone(self, tg_user_id: int) -> bool:
         return bool(self.get_subscriber_phone(tg_user_id))
+
+    def get_subscriber_avatar(self, tg_user_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            value = self.data["subscriber_avatars"].get(str(tg_user_id))
+            return dict(value) if isinstance(value, dict) else None
+
+    def set_subscriber_avatar(
+        self,
+        tg_user_id: int,
+        *,
+        url: str | None = None,
+        file_name: str | None = None,
+        checked_at: int | None = None,
+        has_avatar: bool | None = None,
+    ) -> dict[str, Any]:
+        normalized_checked_at = int(checked_at or time.time())
+        normalized_has_avatar = bool(has_avatar if has_avatar is not None else (url and file_name))
+
+        with self.lock:
+            current = self.data["subscriber_avatars"].get(str(tg_user_id))
+            if not isinstance(current, dict):
+                current = {}
+
+            current["checkedAt"] = normalized_checked_at
+            current["hasAvatar"] = normalized_has_avatar
+
+            if normalized_has_avatar and url and file_name:
+                current["url"] = str(url).strip()
+                current["fileName"] = str(file_name).strip()
+            else:
+                current.pop("url", None)
+                current.pop("fileName", None)
+
+            self.data["subscriber_avatars"][str(tg_user_id)] = current
+            self._save()
+            return dict(current)
 
     def set_subscriber_phone(self, tg_user_id: int, phone: str):
         normalized_phone = str(phone).strip()
@@ -375,6 +414,7 @@ class StateStore:
             "subscriberTelegramId",
             "subscriberName",
             "subscriberPhone",
+            "subscriberAvatarUrl",
             "phone",
             "contractNumber",
             "contractNotCreated",
