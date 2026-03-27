@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import requests
 
 from config import TOKEN
@@ -26,11 +27,20 @@ def _check_response(resp: requests.Response) -> dict:
     return data
 
 
-def tg(method: str, payload: dict | None = None, *, method_type: str = "post", timeout: int = 30) -> dict:
+def tg(
+    method: str,
+    payload: dict | None = None,
+    *,
+    method_type: str = "post",
+    timeout: int = 30,
+    files: dict | None = None,
+) -> dict:
     url = f"{API}/{method}"
     payload = payload or {}
     if method_type == "get":
         resp = requests.get(url, params=payload, timeout=timeout)
+    elif files:
+        resp = requests.post(url, data=payload, files=files, timeout=timeout)
     else:
         resp = requests.post(url, json=payload, timeout=timeout)
     return _check_response(resp)
@@ -63,6 +73,49 @@ def edit_message(
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     return tg("editMessageText", payload)
+
+
+def delete_message(chat_id: int, message_id: int):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+    return tg("deleteMessage", payload)
+
+
+def send_sticker(
+    chat_id: int,
+    sticker: str,
+    *,
+    emoji: str | None = None,
+    reply_markup=None,
+):
+    payload = {
+        "chat_id": chat_id,
+        "sticker": sticker,
+    }
+    if emoji:
+        payload["emoji"] = emoji
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    return tg("sendSticker", payload)
+
+
+def upload_sticker(
+    chat_id: int,
+    file_name: str,
+    content: bytes,
+    *,
+    emoji: str | None = None,
+    reply_markup=None,
+):
+    payload = {"chat_id": str(chat_id)}
+    if emoji:
+        payload["emoji"] = emoji
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    files = {"sticker": (file_name, content)}
+    return tg("sendSticker", payload, files=files)
 
 
 def answer_callback(callback_id: str, text: str = "", show_alert: bool = False):

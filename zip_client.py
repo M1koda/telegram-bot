@@ -89,8 +89,72 @@ class ZipSupportClient:
             payload["subscriberAvatarUrl"] = subscriber_avatar_url
         return self._extract_data(self._request("POST", "/chats", json=payload))
 
-    def send_subscriber_message(self, chat_id: int, text: str) -> dict[str, Any]:
-        return self._extract_data(self._request("POST", f"/chats/{chat_id}/messages", json={"text": text}))
+    def send_subscriber_message(
+        self,
+        chat_id: int,
+        text: str | None = None,
+        *,
+        message_type: str | None = None,
+        payload: dict[str, Any] | None = None,
+        source_message_ref: str | None = None,
+    ) -> dict[str, Any]:
+        request_payload: dict[str, Any] = {}
+        if text is not None:
+            request_payload["text"] = text
+        if message_type:
+            request_payload["messageType"] = message_type
+        if payload is not None:
+            request_payload["payload"] = payload
+        if source_message_ref:
+            request_payload["sourceMessageRef"] = source_message_ref
+        return self._extract_data(self._request("POST", f"/chats/{chat_id}/messages", json=request_payload))
+
+    def update_message_by_source_ref(
+        self,
+        chat_id: int,
+        source_message_ref: str,
+        *,
+        text: str | None = None,
+        message_type: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request_payload: dict[str, Any] = {"sourceMessageRef": source_message_ref}
+        if text is not None:
+            request_payload["text"] = text
+        if message_type:
+            request_payload["messageType"] = message_type
+        if payload is not None:
+            request_payload["payload"] = payload
+        return self._extract_data(
+            self._request("PATCH", f"/chats/{chat_id}/messages/by-source-ref", json=request_payload)
+        )
+
+    def update_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        text: str | None = None,
+        message_type: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request_payload: dict[str, Any] = {}
+        if text is not None:
+            request_payload["text"] = text
+        if message_type:
+            request_payload["messageType"] = message_type
+        if payload is not None:
+            request_payload["payload"] = payload
+        return self._extract_data(self._request("PATCH", f"/chats/{chat_id}/messages/{message_id}", json=request_payload))
+
+    def delete_message_by_source_ref(self, chat_id: int, source_message_ref: str) -> dict[str, Any]:
+        request_payload = {"sourceMessageRef": source_message_ref}
+        return self._extract_data(
+            self._request("DELETE", f"/chats/{chat_id}/messages/by-source-ref", json=request_payload)
+        )
+
+    def delete_message(self, chat_id: int, message_id: int) -> dict[str, Any]:
+        return self._extract_data(self._request("DELETE", f"/chats/{chat_id}/messages/{message_id}"))
 
     def close_chat(self, chat_id: int) -> dict[str, Any]:
         return self._extract_data(self._request("POST", f"/chats/{chat_id}/close"))

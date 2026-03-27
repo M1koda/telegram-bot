@@ -16,6 +16,9 @@ class StateStore:
             "chat_to_tg": {},
             "subscriber_phones": {},
             "subscriber_avatars": {},
+            "subscriber_message_mappings": {},
+            "subscriber_zip_to_source_ref": {},
+            "operator_message_mappings": {},
             "pending_phone_gate_users": [],
             "seen_operator_message_ids": [],
             "welcomed_chat_ids": [],
@@ -36,6 +39,9 @@ class StateStore:
         self.data.setdefault("chat_to_tg", {})
         self.data.setdefault("subscriber_phones", {})
         self.data.setdefault("subscriber_avatars", {})
+        self.data.setdefault("subscriber_message_mappings", {})
+        self.data.setdefault("subscriber_zip_to_source_ref", {})
+        self.data.setdefault("operator_message_mappings", {})
         self.data.setdefault("pending_phone_gate_users", [])
         self.data.setdefault("seen_operator_message_ids", [])
         self.data.setdefault("welcomed_chat_ids", [])
@@ -255,6 +261,130 @@ class StateStore:
         with self.lock:
             if self.data["connection_requests"].pop(str(tg_user_id), None) is not None:
                 self._save()
+
+    def upsert_subscriber_message_mapping(
+        self,
+        source_message_ref: str,
+        *,
+        chat_id: int,
+        telegram_chat_id: int,
+        telegram_message_id: int,
+        zip_message_id: int | None = None,
+        message_type: str | None = None,
+        deleted: bool | None = None,
+    ) -> dict[str, Any]:
+        normalized_source_ref = str(source_message_ref).strip()
+        if not normalized_source_ref:
+            raise ValueError("source_message_ref is required")
+
+        with self.lock:
+            current = self.data["subscriber_message_mappings"].get(normalized_source_ref)
+            if not isinstance(current, dict):
+                current = {}
+
+            previous_zip_message_id = current.get("zipMessageId")
+            if previous_zip_message_id is not None and zip_message_id is not None and int(previous_zip_message_id) != int(zip_message_id):
+                self.data["subscriber_zip_to_source_ref"].pop(str(int(previous_zip_message_id)), None)
+
+            current["sourceMessageRef"] = normalized_source_ref
+            current["chatId"] = int(chat_id)
+            current["telegramChatId"] = int(telegram_chat_id)
+            current["telegramMessageId"] = int(telegram_message_id)
+            if zip_message_id is not None:
+                current["zipMessageId"] = int(zip_message_id)
+                self.data["subscriber_zip_to_source_ref"][str(int(zip_message_id))] = normalized_source_ref
+            if message_type:
+                current["messageType"] = str(message_type)
+            if deleted is not None:
+                current["deleted"] = bool(deleted)
+            else:
+                current.setdefault("deleted", False)
+
+            self.data["subscriber_message_mappings"][normalized_source_ref] = current
+            self._save()
+            return dict(current)
+
+    def get_subscriber_message_mapping(self, source_message_ref: str) -> dict[str, Any] | None:
+        with self.lock:
+            value = self.data["subscriber_message_mappings"].get(str(source_message_ref).strip())
+            return dict(value) if isinstance(value, dict) else None
+
+    def get_subscriber_message_mapping_by_zip_message(self, zip_message_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            source_ref = self.data["subscriber_zip_to_source_ref"].get(str(zip_message_id))
+            if not source_ref:
+                return None
+            value = self.data["subscriber_message_mappings"].get(str(source_ref))
+            return dict(value) if isinstance(value, dict) else None
+
+    def mark_subscriber_message_deleted(
+        self,
+        *,
+        source_message_ref: str | None = None,
+        zip_message_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        with self.lock:
+            resolved_source_ref = None
+            if source_message_ref:
+                resolved_source_ref = str(source_message_ref).strip()
+            elif zip_message_id is not None:
+                resolved_source_ref = self.data["subscriber_zip_to_source_ref"].get(str(zip_message_id))
+            if not resolved_source_ref:
+                return None
+
+            current = self.data["subscriber_message_mappings"].get(resolved_source_ref)
+            if not isinstance(current, dict):
+                return None
+            current["deleted"] = True
+            self._save()
+            return dict(current)
+
+    def upsert_operator_message_mapping(
+        self,
+        zip_message_id: int,
+        *,
+        chat_id: int,
+        telegram_chat_id: int,
+        telegram_message_id: int,
+        message_type: str | None = None,
+        source_message_ref: str | None = None,
+        deleted: bool | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            current = self.data["operator_message_mappings"].get(str(zip_message_id))
+            if not isinstance(current, dict):
+                current = {}
+
+            current["zipMessageId"] = int(zip_message_id)
+            current["chatId"] = int(chat_id)
+            current["telegramChatId"] = int(telegram_chat_id)
+            current["telegramMessageId"] = int(telegram_message_id)
+            if message_type:
+                current["messageType"] = str(message_type)
+            if source_message_ref:
+                current["sourceMessageRef"] = str(source_message_ref).strip()
+            if deleted is not None:
+                current["deleted"] = bool(deleted)
+            else:
+                current.setdefault("deleted", False)
+
+            self.data["operator_message_mappings"][str(zip_message_id)] = current
+            self._save()
+            return dict(current)
+
+    def get_operator_message_mapping(self, zip_message_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            value = self.data["operator_message_mappings"].get(str(zip_message_id))
+            return dict(value) if isinstance(value, dict) else None
+
+    def mark_operator_message_deleted(self, zip_message_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            current = self.data["operator_message_mappings"].get(str(zip_message_id))
+            if not isinstance(current, dict):
+                return None
+            current["deleted"] = True
+            self._save()
+            return dict(current)
 
     def sync_pending_rating(
         self,

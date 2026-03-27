@@ -71,6 +71,7 @@ from state import StateStore
 from telegram_api import (
     TelegramAPIError,
     answer_callback,
+    delete_message,
     download_file,
     edit_message,
     get_file,
@@ -84,6 +85,8 @@ from telegram_api import (
     kb_reply,
     kb_single_button,
     send_message,
+    send_sticker,
+    upload_sticker,
 )
 from zip_client import ZipAPIError, ZipSupportClient
 
@@ -95,6 +98,7 @@ logging.basicConfig(
 logger = logging.getLogger("zip-support-bot")
 
 DEFAULT_SUPPORT_AVATAR_CACHE_DIR = Path(__file__).resolve().parent / "support_avatars"
+DEFAULT_SUPPORT_STICKER_CACHE_DIR = Path(__file__).resolve().parent / "support_stickers"
 
 
 class SupportBot:
@@ -106,6 +110,13 @@ class SupportBot:
         )
         self.avatar_public_base_url = os.getenv("SUPPORT_AVATAR_PUBLIC_BASE_URL", "").rstrip("/")
         self.avatar_refresh_seconds = max(0, int(os.getenv("SUPPORT_AVATAR_REFRESH_SECONDS", "86400")))
+        sticker_public_base_url = os.getenv("SUPPORT_STICKER_PUBLIC_BASE_URL", self.avatar_public_base_url).rstrip("/")
+        default_sticker_cache_dir = str(
+            self.avatar_cache_dir if sticker_public_base_url and sticker_public_base_url == self.avatar_public_base_url
+            else DEFAULT_SUPPORT_STICKER_CACHE_DIR
+        )
+        self.sticker_cache_dir = Path(os.getenv("SUPPORT_STICKER_CACHE_DIR", default_sticker_cache_dir))
+        self.sticker_public_base_url = sticker_public_base_url
         self.sio = socketio.Client(
             reconnection=True,
             reconnection_attempts=ZIP_SOCKET_RECONNECT_ATTEMPTS or 0,
@@ -124,6 +135,15 @@ class SupportBot:
             )
         else:
             logger.warning("Avatar cache disabled: SUPPORT_AVATAR_PUBLIC_BASE_URL is not configured")
+        if self.sticker_public_base_url:
+            self.sticker_cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "Sticker cache enabled dir=%s base_url=%s",
+                self.sticker_cache_dir,
+                self.sticker_public_base_url,
+            )
+        else:
+            logger.warning("Sticker cache disabled: SUPPORT_STICKER_PUBLIC_BASE_URL is not configured")
         self._register_socket_handlers()
 
     def _has_open_chat(self, tg_user_id: int) -> bool:
@@ -216,9 +236,23 @@ class SupportBot:
         @self.sio.on("support:new-message")
         def on_new_message(data: dict[str, Any]):
             try:
-                self.handle_operator_message_event(data)
+                self.handle_support_message_event(data)
             except Exception:
                 logger.exception("Failed to process support:new-message")
+
+        @self.sio.on("support:message-updated")
+        def on_message_updated(data: dict[str, Any]):
+            try:
+                self.handle_message_updated_event(data)
+            except Exception:
+                logger.exception("Failed to process support:message-updated")
+
+        @self.sio.on("support:message-deleted")
+        def on_message_deleted(data: dict[str, Any]):
+            try:
+                self.handle_message_deleted_event(data)
+            except Exception:
+                logger.exception("Failed to process support:message-deleted")
 
         @self.sio.on("support:chat-closed")
         def on_chat_closed(data: dict[str, Any]):
@@ -296,6 +330,8 @@ class SupportBot:
                     self.offset = upd["update_id"] + 1
                     if "callback_query" in upd:
                         self.handle_callback_query(upd["callback_query"])
+                    elif "edited_message" in upd:
+                        self.handle_edited_message(upd["edited_message"])
                     elif "message" in upd:
                         self.handle_message(upd["message"])
             except (requests.RequestException, TelegramAPIError):
@@ -314,7 +350,9 @@ class SupportBot:
 
         tg_user_id = int(chat["id"])
         contact = message.get("contact")
-        text = (message.get("text") or "").strip()
+        raw_text = str(message.get("text") or "")
+        text = raw_text.strip()
+        has_sticker = isinstance(message.get("sticker"), dict)
         pending_comment = self.state.get_pending_comment_request_for_tg(tg_user_id)
         waiting_request_input = self.state.is_waiting_request_input(tg_user_id)
         connection_request = self.state.get_connection_request(tg_user_id)
@@ -327,7 +365,7 @@ class SupportBot:
             send_message(tg_user_id, PHONE_GATE_PROMPT_TEXT, self._phone_gate_keyboard())
             return
 
-        if not text:
+        if not text and not has_sticker:
             if waiting_request_input:
                 send_message(tg_user_id, NON_TEXT_MESSAGE_TEXT, self._request_draft_keyboard())
             elif connection_request is not None:
@@ -379,10 +417,16 @@ class SupportBot:
             return
 
         if connection_request is not None:
+            if not text:
+                send_message(tg_user_id, NON_TEXT_MESSAGE_TEXT, self._connection_keyboard_for_step(connection_request))
+                return
             self._handle_connection_request_step(tg_user_id, message, text, connection_request)
             return
 
         if pending_comment is not None:
+            if not text:
+                send_message(tg_user_id, NON_TEXT_MESSAGE_TEXT, self._rating_comment_keyboard())
+                return
             self._handle_rating_comment(tg_user_id, text, pending_comment)
             return
 
@@ -391,8 +435,15 @@ class SupportBot:
             return
 
         try:
+            outbound_message = self._build_subscriber_outbound_message(message)
+            if outbound_message is None:
+                if waiting_request_input:
+                    send_message(tg_user_id, NON_TEXT_MESSAGE_TEXT, self._request_draft_keyboard())
+                else:
+                    self._send_main_message(tg_user_id, NON_TEXT_MESSAGE_TEXT)
+                return
             subscriber_name = self._build_subscriber_name(message)
-            support_chat_id = self._forward_subscriber_message(tg_user_id, subscriber_name, text)
+            support_chat_id = self._forward_subscriber_message(tg_user_id, subscriber_name, outbound_message)
             self.state.clear_request_draft(tg_user_id)
             if not self.state.is_welcomed(support_chat_id):
                 self._send_main_message(tg_user_id, WAITING_TEXT)
@@ -402,6 +453,62 @@ class SupportBot:
                 return
             logger.exception("Failed to send message to ZIP")
             self._send_main_message(tg_user_id, SEND_ERROR_TEXT)
+        except (OSError, requests.RequestException, TelegramAPIError):
+            logger.exception("Failed to prepare Telegram message payload for ZIP")
+            self._send_main_message(tg_user_id, SEND_ERROR_TEXT)
+
+    def handle_edited_message(self, message: dict[str, Any]):
+        chat = message.get("chat", {})
+        if chat.get("type") != "private":
+            return
+
+        tg_user_id = int(chat["id"])
+        telegram_message_id = self._safe_int(message.get("message_id"))
+        if telegram_message_id is None:
+            return
+
+        outbound_message = self._build_subscriber_outbound_message(message)
+        if outbound_message is None:
+            return
+
+        source_message_ref = self._build_source_message_ref(tg_user_id, telegram_message_id)
+        mapping = self.state.get_subscriber_message_mapping(source_message_ref)
+        if mapping and mapping.get("deleted"):
+            return
+
+        chat_id = self._safe_int((mapping or {}).get("chatId"))
+        if chat_id is None:
+            chat_id = self.state.get_chat_by_tg(tg_user_id)
+        if chat_id is None:
+            logger.info("Skipping edited Telegram message without mapped support chat ref=%s", source_message_ref)
+            return
+
+        try:
+            updated_message = self.zip.update_message_by_source_ref(
+                chat_id,
+                source_message_ref,
+                text=outbound_message.get("text"),
+                message_type=str(outbound_message.get("message_type") or ""),
+                payload=outbound_message.get("payload"),
+            )
+            zip_message_id = self._safe_int((updated_message or {}).get("id")) or self._safe_int(
+                (mapping or {}).get("zipMessageId")
+            )
+            self.state.upsert_subscriber_message_mapping(
+                source_message_ref,
+                chat_id=chat_id,
+                telegram_chat_id=tg_user_id,
+                telegram_message_id=telegram_message_id,
+                zip_message_id=zip_message_id,
+                message_type=str(outbound_message.get("message_type") or ""),
+                deleted=False,
+            )
+        except (ZipAPIError, OSError, requests.RequestException, TelegramAPIError):
+            logger.exception(
+                "Failed to sync edited Telegram message tg_chat=%s tg_message=%s",
+                tg_user_id,
+                telegram_message_id,
+            )
 
     def handle_callback_query(self, query: dict[str, Any]):
         callback_id = query.get("id")
@@ -466,22 +573,30 @@ class SupportBot:
             score=callback["score"],
         )
 
-    def handle_operator_message_event(self, data: dict[str, Any]):
-        message = data.get("message") or {}
-        if message.get("senderType") != "operator":
+    def handle_support_message_event(self, data: dict[str, Any]):
+        message = self._extract_message_payload(data)
+        if message is None:
+            logger.warning("No message payload in support:new-message event: %s", data)
             return
 
         chat = self._extract_chat_payload(data)
         if chat is not None:
             self._sync_chat_snapshot(chat, source="support:new-message")
 
-        message_id = message.get("id")
-        if isinstance(message_id, int) and not self.state.mark_seen_operator_message(message_id):
-            return
-
         chat_id = self._extract_chat_id(data, chat=chat)
         if chat_id is None:
             logger.warning("No chat id in support:new-message payload: %s", data)
+            return
+
+        sender_type = str(message.get("senderType") or "").lower()
+        if sender_type == "subscriber":
+            self._sync_subscriber_mapping_from_zip_message(message, chat_id)
+            return
+        if sender_type != "operator":
+            return
+
+        zip_message_id = self._safe_int(message.get("id"))
+        if zip_message_id is not None and not self.state.mark_seen_operator_message(zip_message_id):
             return
 
         tg_user_id = self._resolve_event_tg_user_id(chat, chat_id)
@@ -489,11 +604,138 @@ class SupportBot:
             logger.warning("No Telegram user found for support chat %s", chat_id)
             return
 
-        text = (message.get("text") or "").strip()
-        if not text:
+        response = self._send_operator_mirror_message(tg_user_id, message)
+        telegram_message_id = self._safe_int((response or {}).get("result", {}).get("message_id"))
+        if zip_message_id is not None and telegram_message_id is not None:
+            self.state.upsert_operator_message_mapping(
+                zip_message_id,
+                chat_id=chat_id,
+                telegram_chat_id=tg_user_id,
+                telegram_message_id=telegram_message_id,
+                message_type=self._extract_support_message_type(message),
+                source_message_ref=str(message.get("sourceMessageRef") or "").strip() or None,
+                deleted=False,
+            )
+
+    def handle_message_updated_event(self, data: dict[str, Any]):
+        message = self._extract_message_payload(data)
+        if message is None:
+            logger.warning("No message payload in support:message-updated event: %s", data)
             return
 
-        self._send_main_message(tg_user_id, f"{OPERATOR_MESSAGE_PREFIX}{text}")
+        chat = self._extract_chat_payload(data)
+        if chat is not None:
+            self._sync_chat_snapshot(chat, source="support:message-updated")
+
+        chat_id = self._extract_chat_id(data, chat=chat)
+        sender_type = str(message.get("senderType") or "").lower()
+        if sender_type == "subscriber":
+            self._sync_subscriber_mapping_from_zip_message(message, chat_id)
+            return
+        if sender_type != "operator":
+            return
+
+        zip_message_id = self._safe_int(message.get("id"))
+        if zip_message_id is None:
+            logger.warning("No message id in support:message-updated event: %s", data)
+            return
+
+        mapping = self.state.get_operator_message_mapping(zip_message_id)
+        if mapping is None or mapping.get("deleted"):
+            logger.info("Skipping operator message update without Telegram mapping zip_message=%s", zip_message_id)
+            return
+
+        telegram_chat_id = self._safe_int(mapping.get("telegramChatId"))
+        telegram_message_id = self._safe_int(mapping.get("telegramMessageId"))
+        mapped_chat_id = self._safe_int(mapping.get("chatId"))
+        effective_chat_id = chat_id if chat_id is not None else mapped_chat_id
+        if telegram_chat_id is None or telegram_message_id is None or effective_chat_id is None:
+            return
+
+        message_type = self._extract_support_message_type(message)
+        previous_message_type = str(mapping.get("messageType") or "").strip().lower()
+        if message_type == "text" and previous_message_type in {"", "text"}:
+            text = self._build_operator_text(message)
+            if not text:
+                return
+            try:
+                edit_message(telegram_chat_id, telegram_message_id, text)
+                self.state.upsert_operator_message_mapping(
+                    zip_message_id,
+                    chat_id=effective_chat_id,
+                    telegram_chat_id=telegram_chat_id,
+                    telegram_message_id=telegram_message_id,
+                    message_type=message_type,
+                    source_message_ref=str(message.get("sourceMessageRef") or "").strip() or None,
+                    deleted=False,
+                )
+            except TelegramAPIError:
+                logger.exception(
+                    "Failed to edit Telegram mirror chat=%s message=%s for zip message=%s",
+                    telegram_chat_id,
+                    telegram_message_id,
+                    zip_message_id,
+                )
+                self._replace_operator_mirror_message(
+                    zip_message_id=zip_message_id,
+                    message=message,
+                    chat_id=effective_chat_id,
+                    telegram_chat_id=telegram_chat_id,
+                    old_telegram_message_id=telegram_message_id,
+                )
+            return
+
+        self._replace_operator_mirror_message(
+            zip_message_id=zip_message_id,
+            message=message,
+            chat_id=effective_chat_id,
+            telegram_chat_id=telegram_chat_id,
+            old_telegram_message_id=telegram_message_id,
+        )
+
+    def handle_message_deleted_event(self, data: dict[str, Any]):
+        message = self._extract_message_payload(data)
+        chat = self._extract_chat_payload(data)
+        if chat is not None:
+            self._sync_chat_snapshot(chat, source="support:message-deleted")
+
+        chat_id = self._extract_chat_id(data, chat=chat)
+        zip_message_id = self._extract_message_id(data, message=message)
+        if zip_message_id is None:
+            logger.warning("No message id in support:message-deleted event: %s", data)
+            return
+
+        sender_type = str((message or {}).get("senderType") or "").lower()
+        operator_mapping = self.state.get_operator_message_mapping(zip_message_id)
+        if sender_type == "operator" or operator_mapping is not None:
+            if operator_mapping is None:
+                return
+            telegram_chat_id = self._safe_int(operator_mapping.get("telegramChatId"))
+            telegram_message_id = self._safe_int(operator_mapping.get("telegramMessageId"))
+            if telegram_chat_id is not None and telegram_message_id is not None:
+                try:
+                    delete_message(telegram_chat_id, telegram_message_id)
+                except TelegramAPIError:
+                    logger.exception(
+                        "Failed to delete Telegram mirror chat=%s message=%s for zip message=%s",
+                        telegram_chat_id,
+                        telegram_message_id,
+                        zip_message_id,
+                    )
+            self.state.mark_operator_message_deleted(zip_message_id)
+            return
+
+        if sender_type == "subscriber":
+            source_message_ref = str((message or {}).get("sourceMessageRef") or "").strip() or None
+            self.state.mark_subscriber_message_deleted(
+                source_message_ref=source_message_ref,
+                zip_message_id=zip_message_id,
+            )
+            return
+
+        subscriber_mapping = self.state.get_subscriber_message_mapping_by_zip_message(zip_message_id)
+        if subscriber_mapping is not None:
+            self.state.mark_subscriber_message_deleted(zip_message_id=zip_message_id)
 
     def handle_chat_closed_event(self, data: dict[str, Any]):
         chat = self._extract_chat_payload(data) or {}
@@ -622,7 +864,13 @@ class SupportBot:
         tg_user_id = self._extract_subscriber_tg_id(chat)
         return tg_user_id
 
-    def _forward_subscriber_message(self, tg_user_id: int, subscriber_name: str, text: str) -> int:
+    def _forward_subscriber_message(
+        self,
+        tg_user_id: int,
+        subscriber_name: str,
+        outbound_message: str | dict[str, Any],
+    ) -> int:
+        prepared_message = self._normalize_outbound_subscriber_message(outbound_message)
         subscriber_phone = self.state.get_subscriber_phone(tg_user_id)
         subscriber_avatar_url = self._ensure_subscriber_avatar_url(tg_user_id)
         chat_data = self.zip.ensure_chat(
@@ -638,7 +886,14 @@ class SupportBot:
         self.state.set_chat(tg_user_id, support_chat_id)
 
         try:
-            self.zip.send_subscriber_message(support_chat_id, text)
+            created_message = self.zip.send_subscriber_message(
+                support_chat_id,
+                prepared_message.get("text"),
+                message_type=str(prepared_message.get("message_type") or ""),
+                payload=prepared_message.get("payload"),
+                source_message_ref=str(prepared_message.get("source_message_ref") or "") or None,
+            )
+            self._record_subscriber_message_mapping(support_chat_id, prepared_message, created_message)
             return support_chat_id
         except ZipAPIError as exc:
             if not self._is_stale_chat_error(exc):
@@ -660,7 +915,14 @@ class SupportBot:
                 raise ZipAPIError("ZIP API returned retry chat payload without id") from exc
             self.state.set_chat(tg_user_id, refreshed_chat_id)
 
-            self.zip.send_subscriber_message(refreshed_chat_id, text)
+            created_message = self.zip.send_subscriber_message(
+                refreshed_chat_id,
+                prepared_message.get("text"),
+                message_type=str(prepared_message.get("message_type") or ""),
+                payload=prepared_message.get("payload"),
+                source_message_ref=str(prepared_message.get("source_message_ref") or "") or None,
+            )
+            self._record_subscriber_message_mapping(refreshed_chat_id, prepared_message, created_message)
             return refreshed_chat_id
 
     def _handle_close_chat_request(self, tg_user_id: int):
@@ -993,6 +1255,374 @@ class SupportBot:
                 current.get("topic"),
             )
         return previous, current
+
+    @staticmethod
+    def _normalize_outbound_subscriber_message(outbound_message: str | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(outbound_message, str):
+            return {
+                "text": outbound_message,
+                "message_type": "text",
+                "payload": None,
+                "source_message_ref": None,
+                "telegram_chat_id": None,
+                "telegram_message_id": None,
+            }
+
+        normalized = dict(outbound_message)
+        normalized.setdefault("message_type", "text" if normalized.get("text") is not None else None)
+        normalized.setdefault("payload", None)
+        normalized.setdefault("source_message_ref", None)
+        normalized.setdefault("telegram_chat_id", None)
+        normalized.setdefault("telegram_message_id", None)
+        return normalized
+
+    def _record_subscriber_message_mapping(
+        self,
+        chat_id: int,
+        outbound_message: dict[str, Any],
+        created_message: dict[str, Any] | None,
+    ):
+        source_message_ref = str(outbound_message.get("source_message_ref") or "").strip()
+        telegram_chat_id = self._safe_int(outbound_message.get("telegram_chat_id"))
+        telegram_message_id = self._safe_int(outbound_message.get("telegram_message_id"))
+        if not source_message_ref or telegram_chat_id is None or telegram_message_id is None:
+            return
+
+        created_payload = self._extract_message_payload({"message": created_message or {}})
+        if created_payload is None and isinstance(created_message, dict):
+            created_payload = created_message
+        zip_message_id = self._safe_int((created_payload or {}).get("id"))
+        self.state.upsert_subscriber_message_mapping(
+            source_message_ref,
+            chat_id=chat_id,
+            telegram_chat_id=telegram_chat_id,
+            telegram_message_id=telegram_message_id,
+            zip_message_id=zip_message_id,
+            message_type=str(outbound_message.get("message_type") or ""),
+            deleted=False,
+        )
+
+    def _build_subscriber_outbound_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        if isinstance(message.get("sticker"), dict):
+            return self._build_subscriber_sticker_message(message)
+        if message.get("text") is not None:
+            return self._build_subscriber_text_message(message)
+        return None
+
+    @staticmethod
+    def _build_source_message_ref(telegram_chat_id: int, telegram_message_id: int) -> str:
+        return f"telegram:{telegram_chat_id}:{telegram_message_id}"
+
+    def _build_subscriber_text_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        chat = message.get("chat") or {}
+        telegram_chat_id = self._safe_int(chat.get("id"))
+        telegram_message_id = self._safe_int(message.get("message_id"))
+        text = str(message.get("text") or "")
+        if telegram_chat_id is None or telegram_message_id is None or not text:
+            return None
+
+        return {
+            "text": text,
+            "message_type": "text",
+            "payload": {
+                "customEmojiEntities": self._extract_custom_emoji_entities(text, message.get("entities")),
+            },
+            "source_message_ref": self._build_source_message_ref(telegram_chat_id, telegram_message_id),
+            "telegram_chat_id": telegram_chat_id,
+            "telegram_message_id": telegram_message_id,
+        }
+
+    def _build_subscriber_sticker_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        chat = message.get("chat") or {}
+        telegram_chat_id = self._safe_int(chat.get("id"))
+        telegram_message_id = self._safe_int(message.get("message_id"))
+        sticker = message.get("sticker")
+        if telegram_chat_id is None or telegram_message_id is None or not isinstance(sticker, dict):
+            return None
+
+        sticker_payload = self._build_sticker_payload_from_telegram_sticker(sticker)
+        if sticker_payload is None:
+            return None
+
+        return {
+            "text": None,
+            "message_type": "sticker",
+            "payload": {"sticker": sticker_payload},
+            "source_message_ref": self._build_source_message_ref(telegram_chat_id, telegram_message_id),
+            "telegram_chat_id": telegram_chat_id,
+            "telegram_message_id": telegram_message_id,
+        }
+
+    def _extract_custom_emoji_entities(self, text: str, entities: Any) -> list[dict[str, Any]]:
+        if not isinstance(entities, list):
+            return []
+
+        items: list[dict[str, Any]] = []
+        for entity in entities:
+            if not isinstance(entity, dict) or str(entity.get("type") or "") != "custom_emoji":
+                continue
+            offset = self._safe_int(entity.get("offset"))
+            length = self._safe_int(entity.get("length"))
+            custom_emoji_id = str(entity.get("custom_emoji_id") or "").strip()
+            if offset is None or length is None or length <= 0 or not custom_emoji_id:
+                continue
+            items.append(
+                {
+                    "offset": offset,
+                    "length": length,
+                    "emojiId": custom_emoji_id,
+                    "alt": self._slice_text_by_utf16(text, offset, length),
+                }
+            )
+        return items
+
+    @staticmethod
+    def _slice_text_by_utf16(text: str, offset: int, length: int) -> str:
+        encoded = text.encode("utf-16-le")
+        start = max(0, int(offset) * 2)
+        end = max(start, (int(offset) + int(length)) * 2)
+        if start >= len(encoded):
+            return ""
+        return encoded[start:end].decode("utf-16-le", errors="ignore")
+
+    def _build_sticker_payload_from_telegram_sticker(self, sticker: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.sticker_public_base_url:
+            logger.warning("Skipping Telegram sticker sync because sticker cache is not configured")
+            return None
+
+        file_id = str(sticker.get("file_id") or "").strip()
+        if not file_id:
+            return None
+
+        file_payload = get_file(file_id)
+        file_info = file_payload.get("result") or {}
+        telegram_file_path = str(file_info.get("file_path") or "").strip()
+        if not telegram_file_path:
+            raise TelegramAPIError("Telegram getFile returned empty sticker file_path")
+
+        content, content_type = download_file(telegram_file_path)
+        file_name = self._store_sticker_file(sticker, telegram_file_path, content, content_type=content_type)
+        sticker_format = self._detect_telegram_sticker_format(sticker)
+
+        payload: dict[str, Any] = {
+            "url": self._build_sticker_public_url(file_name),
+            "format": sticker_format,
+        }
+        if sticker_format == "static":
+            payload["previewUrl"] = payload["url"]
+
+        emoji = str(sticker.get("emoji") or "").strip()
+        if emoji:
+            payload["emoji"] = emoji
+
+        set_name = str(sticker.get("set_name") or "").strip()
+        if set_name:
+            payload["setName"] = set_name
+
+        width = self._safe_int(sticker.get("width"))
+        height = self._safe_int(sticker.get("height"))
+        if width is not None:
+            payload["width"] = width
+        if height is not None:
+            payload["height"] = height
+
+        return payload
+
+    def _sync_subscriber_mapping_from_zip_message(self, message: dict[str, Any], chat_id: int | None):
+        source_message_ref = str(message.get("sourceMessageRef") or "").strip()
+        zip_message_id = self._safe_int(message.get("id"))
+        if not source_message_ref:
+            return
+
+        current = self.state.get_subscriber_message_mapping(source_message_ref)
+        if current is None:
+            return
+
+        mapped_chat_id = self._safe_int(current.get("chatId"))
+        telegram_chat_id = self._safe_int(current.get("telegramChatId"))
+        telegram_message_id = self._safe_int(current.get("telegramMessageId"))
+        if telegram_chat_id is None or telegram_message_id is None:
+            return
+
+        effective_chat_id = chat_id if chat_id is not None else mapped_chat_id
+        if effective_chat_id is None:
+            return
+
+        self.state.upsert_subscriber_message_mapping(
+            source_message_ref,
+            chat_id=effective_chat_id,
+            telegram_chat_id=telegram_chat_id,
+            telegram_message_id=telegram_message_id,
+            zip_message_id=zip_message_id,
+            message_type=self._extract_support_message_type(message),
+            deleted=self._is_support_message_deleted(message),
+        )
+
+    @staticmethod
+    def _extract_support_message_type(message: dict[str, Any]) -> str:
+        message_type = str(message.get("messageType") or message.get("type") or "").strip().lower()
+        if message_type:
+            return message_type
+
+        payload = message.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("sticker"), dict):
+            return "sticker"
+        if isinstance(message.get("sticker"), dict):
+            return "sticker"
+        return "text"
+
+    @staticmethod
+    def _is_support_message_deleted(message: dict[str, Any]) -> bool:
+        return bool(message.get("isDeleted") or message.get("deletedAt") or message.get("deleted"))
+
+    def _build_operator_text(self, message: dict[str, Any]) -> str:
+        text = str(message.get("text") or "").strip()
+        if not text:
+            return ""
+        return f"{OPERATOR_MESSAGE_PREFIX}{text}"
+
+    def _send_operator_mirror_message(self, tg_user_id: int, message: dict[str, Any]) -> dict[str, Any] | None:
+        if self._extract_support_message_type(message) == "sticker":
+            return self._send_operator_sticker_message(tg_user_id, message)
+
+        text = self._build_operator_text(message)
+        if not text:
+            return None
+        return send_message(tg_user_id, text)
+
+    def _send_operator_sticker_message(self, tg_user_id: int, message: dict[str, Any]) -> dict[str, Any] | None:
+        payload = message.get("payload")
+        sticker = payload.get("sticker") if isinstance(payload, dict) else None
+        if not isinstance(sticker, dict):
+            return None
+
+        sticker_format = str(sticker.get("format") or "static").strip().lower()
+        sticker_url = self._select_operator_sticker_url(sticker, sticker_format=sticker_format)
+        if not sticker_url:
+            return None
+
+        emoji = str(sticker.get("emoji") or "").strip() or None
+        if sticker_format == "static":
+            return send_sticker(tg_user_id, sticker_url, emoji=emoji)
+
+        file_name, content = self._download_remote_sticker_asset(sticker_url, sticker_format=sticker_format)
+        return upload_sticker(tg_user_id, file_name, content, emoji=emoji)
+
+    def _replace_operator_mirror_message(
+        self,
+        *,
+        zip_message_id: int,
+        message: dict[str, Any],
+        chat_id: int,
+        telegram_chat_id: int,
+        old_telegram_message_id: int,
+    ):
+        response = self._send_operator_mirror_message(telegram_chat_id, message)
+        new_telegram_message_id = self._safe_int((response or {}).get("result", {}).get("message_id"))
+        if new_telegram_message_id is None:
+            return
+
+        try:
+            delete_message(telegram_chat_id, old_telegram_message_id)
+        except TelegramAPIError:
+            logger.exception(
+                "Failed to delete old Telegram mirror chat=%s message=%s for zip message=%s",
+                telegram_chat_id,
+                old_telegram_message_id,
+                zip_message_id,
+            )
+
+        self.state.upsert_operator_message_mapping(
+            zip_message_id,
+            chat_id=chat_id,
+            telegram_chat_id=telegram_chat_id,
+            telegram_message_id=new_telegram_message_id,
+            message_type=self._extract_support_message_type(message),
+            source_message_ref=str(message.get("sourceMessageRef") or "").strip() or None,
+            deleted=False,
+        )
+
+    @staticmethod
+    def _select_operator_sticker_url(sticker: dict[str, Any], *, sticker_format: str) -> str | None:
+        if sticker_format in {"animated", "video"}:
+            value = sticker.get("animationUrl") or sticker.get("url")
+        else:
+            value = sticker.get("url")
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    def _download_remote_sticker_asset(self, sticker_url: str, *, sticker_format: str) -> tuple[str, bytes]:
+        resp = requests.get(sticker_url, timeout=30)
+        resp.raise_for_status()
+        extension = Path(sticker_url.split("?", 1)[0]).suffix.lower()
+        if not extension:
+            extension = {
+                "animated": ".tgs",
+                "video": ".webm",
+            }.get(sticker_format, ".webp")
+        file_name = f"operator_sticker_{int(time.time() * 1000)}{extension}"
+        return file_name, resp.content
+
+    @staticmethod
+    def _detect_telegram_sticker_format(sticker: dict[str, Any]) -> str:
+        if sticker.get("is_video"):
+            return "video"
+        if sticker.get("is_animated"):
+            return "animated"
+        return "static"
+
+    def _store_sticker_file(
+        self,
+        sticker: dict[str, Any],
+        telegram_file_path: str,
+        content: bytes,
+        *,
+        content_type: str | None = None,
+    ) -> str:
+        extension = self._infer_sticker_extension(sticker, telegram_file_path, content_type=content_type)
+        raw_token = str(sticker.get("file_unique_id") or sticker.get("file_id") or int(time.time() * 1000))
+        safe_token = "".join(char for char in raw_token if char.isalnum() or char in {"-", "_"})
+        file_name = f"sticker_{safe_token or int(time.time() * 1000)}{extension}"
+        destination = self._sticker_path(file_name)
+        temp_destination = destination.with_name(f"{destination.name}.tmp")
+
+        self.sticker_cache_dir.mkdir(parents=True, exist_ok=True)
+        temp_destination.write_bytes(content)
+        temp_destination.replace(destination)
+        return file_name
+
+    def _build_sticker_public_url(self, file_name: str) -> str:
+        return f"{self.sticker_public_base_url}/{quote(file_name)}"
+
+    def _sticker_path(self, file_name: str) -> Path:
+        return self.sticker_cache_dir / file_name
+
+    @staticmethod
+    def _infer_sticker_extension(
+        sticker: dict[str, Any],
+        telegram_file_path: str,
+        *,
+        content_type: str | None = None,
+    ) -> str:
+        extension = Path(telegram_file_path).suffix.lower()
+        if extension in {".webp", ".tgs", ".webm", ".png"}:
+            return extension
+
+        sticker_format = SupportBot._detect_telegram_sticker_format(sticker)
+        if sticker_format == "animated":
+            return ".tgs"
+        if sticker_format == "video":
+            return ".webm"
+
+        content_type_map = {
+            "image/webp": ".webp",
+            "application/x-tgsticker": ".tgs",
+            "application/gzip": ".tgs",
+            "video/webm": ".webm",
+            "image/png": ".png",
+        }
+        normalized_content_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        return content_type_map.get(normalized_content_type, ".webp")
 
     def _ensure_subscriber_avatar_url(self, tg_user_id: int) -> str | None:
         avatar_meta = self.state.get_subscriber_avatar(tg_user_id)
@@ -1354,6 +1984,53 @@ class SupportBot:
         return "subscriber phone is required before creating a chat" in exc.details_text().lower()
 
     @staticmethod
+    def _extract_message_payload(data: dict[str, Any]) -> dict[str, Any] | None:
+        def looks_like_message(candidate: Any) -> bool:
+            if not isinstance(candidate, dict):
+                return False
+            if candidate.get("senderType") is not None:
+                return True
+            if candidate.get("sourceMessageRef") is not None:
+                return True
+            if candidate.get("messageType") is not None:
+                return True
+            payload = candidate.get("payload")
+            return isinstance(payload, dict) and bool(payload)
+
+        candidates = []
+        direct_message = data.get("message")
+        if looks_like_message(direct_message):
+            candidates.append(direct_message)
+
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            nested_message = nested.get("message")
+            if looks_like_message(nested_message):
+                candidates.append(nested_message)
+            if looks_like_message(nested):
+                candidates.append(nested)
+
+        if looks_like_message(data):
+            candidates.append(data)
+
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _extract_message_id(data: dict[str, Any], *, message: dict[str, Any] | None = None) -> int | None:
+        value = data.get("messageId")
+        if value is None and isinstance(message, dict):
+            value = message.get("id")
+        if value is None:
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                value = nested.get("messageId")
+                if value is None:
+                    nested_message = nested.get("message")
+                    if isinstance(nested_message, dict):
+                        value = nested_message.get("id")
+        return int(value) if value is not None else None
+
+    @staticmethod
     def _extract_chat_payload(data: dict[str, Any]) -> dict[str, Any] | None:
         def looks_like_chat(candidate: Any) -> bool:
             if not isinstance(candidate, dict):
@@ -1387,6 +2064,14 @@ class SupportBot:
             message = data.get("message")
             if isinstance(message, dict):
                 value = message.get("chatId")
+        if value is None:
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                value = nested.get("chatId")
+                if value is None:
+                    nested_message = nested.get("message")
+                    if isinstance(nested_message, dict):
+                        value = nested_message.get("chatId")
         if value is None and chat is not None:
             value = chat.get("id")
         return int(value) if value is not None else None
