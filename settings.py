@@ -1,8 +1,18 @@
+import os
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 TELEGRAM_POLL_TIMEOUT = 30
 TELEGRAM_RETRY_DELAY = 2.0
 
 ZIP_SOCKET_PATH = "/ws"
-ZIP_SOCKET_VERIFY_SSL = False
+ZIP_SOCKET_VERIFY_SSL = _env_flag("ZIP_SOCKET_VERIFY_SSL", True)
 ZIP_SOCKET_RECONNECT_ATTEMPTS = 0
 
 STATE_FILE = "bot_state.json"
